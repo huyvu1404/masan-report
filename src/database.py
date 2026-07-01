@@ -167,17 +167,34 @@ def _task_row_to_dict(row: sqlite3.Row) -> dict:
     return r
 
 
-def create_task(
+def claim_task(
     task_id: str,
     main_brand: str,
     competitors: list[str],
     start_date: str,
     end_date: str,
-) -> None:
+) -> tuple[str, bool]:
+    """
+    Atomically check for an active task then create one if none exists.
+
+    Returns (task_id, created):
+      - created=True  → new task inserted, caller should start the pipeline
+      - created=False → existing pending/running task found, caller should reuse it
+    """
     competitors_json = json.dumps(competitors)
     created_at = datetime.now().isoformat()
     with _lock:
         conn = _connect()
+        row = conn.execute(
+            "SELECT task_id FROM tasks "
+            "WHERE main_brand=? AND competitors=? AND start_date=? AND end_date=? "
+            "  AND status IN ('pending','running') "
+            "ORDER BY created_at DESC LIMIT 1",
+            (main_brand, competitors_json, start_date, end_date),
+        ).fetchone()
+        if row:
+            conn.close()
+            return row["task_id"], False
         conn.execute(
             "INSERT INTO tasks "
             "(task_id, status, step, file_path, filename, error, "
@@ -188,6 +205,7 @@ def create_task(
         )
         conn.commit()
         conn.close()
+    return task_id, True
 
 
 def update_task(task_id: str, **kwargs) -> None:

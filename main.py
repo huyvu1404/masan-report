@@ -363,7 +363,7 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
     - Nếu **chưa có**, tạo task mới → poll `GET /task/{task_id}` để theo dõi tiến độ.
     - Data thô sẽ được **cache** vào `./data`; lần sau cùng params sẽ bỏ qua bước fetch.
     """
-    # Check SQLite for exact match (main_brand + competitors + dates)
+    # 1. Report đã tồn tại?
     existing = db.find_report(req.main_brand, req.competitors, req.start_date, req.end_date)
     if existing:
         fname = existing["report_name"]
@@ -375,8 +375,13 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
             }
         # Record in DB but file deleted — fall through to regenerate
 
-    task_id = str(uuid.uuid4())
-    db.create_task(task_id, req.main_brand, req.competitors, req.start_date, req.end_date)
+    # 2. Atomic check + create — ngăn duplicate pipeline khi 2 request đến cùng lúc
+    task_id, created = db.claim_task(
+        str(uuid.uuid4()), req.main_brand, req.competitors, req.start_date, req.end_date
+    )
+    if not created:
+        return {"task_id": task_id, "already_running": True}
+
     background_tasks.add_task(_run_pipeline, task_id, req)
     return {"task_id": task_id}
 
