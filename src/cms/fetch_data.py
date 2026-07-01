@@ -65,7 +65,7 @@ _CHANNEL_MAP = {
     "THREADS": "Threads",
     "REVIEW": "Review",
 }
-\
+
 
 def _type_map(raw_type: str) -> str:
     if not raw_type:

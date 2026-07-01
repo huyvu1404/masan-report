@@ -54,12 +54,6 @@ from src.report_generator import generate_report
 TEMPLATE_PATH  = Path(os.getenv("TEMPLATE_PATH", "Template_full_fixed.pptx")).resolve()
 CMS_PROJECT_ID = os.getenv("CMS_PROJECT_ID", "")
 
-MINIO_ENDPOINT   = os.getenv("MINIO_ENDPOINT", "localhost:9000")
-MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "")
-MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "")
-MINIO_BUCKET     = os.getenv("MINIO_BUCKET", "reports")
-MINIO_SECURE     = os.getenv("MINIO_SECURE", "false").lower() == "true"
-
 # ── App ───────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
@@ -754,8 +748,6 @@ def list_topics(project_id: str | None = None):
                         "template":        "/app/Template_full_fixed.pptx",
                         "template_exists": True,
                         "cms_project_id":  "6650a1b2c3d4e5f600000001",
-                        "minio_endpoint":  "localhost:9000",
-                        "minio_bucket":    "reports",
                     }
                 }
             },
@@ -768,9 +760,7 @@ def health():
         "status":           "ok",
         "template":         str(TEMPLATE_PATH),
         "template_exists":  TEMPLATE_PATH.exists(),
-        "cms_project_id":   CMS_PROJECT_ID or "(not set)",
-        "minio_endpoint":   MINIO_ENDPOINT,
-        "minio_bucket":     MINIO_BUCKET,
+        "cms_project_id":   CMS_PROJECT_ID or "(not set)"
     }
 
 
