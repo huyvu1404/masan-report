@@ -1,0 +1,25 @@
+# Secrets
+.env
+service-account.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.python-version
+
+# Data & output
+output/
+dummy_data.xlsx
+prompt.txt
+
+# macOS
+.DS_Store
+
+# Template analysis (không cần thiết cho production)
+template_structure.json
+output_structure.json
+report/
+data/
+test*

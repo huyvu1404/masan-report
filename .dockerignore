@@ -1,0 +1,17 @@
+.env
+.DS_Store
+__pycache__/
+*.pyc
+*.pyo
+output/
+*.xlsx
+dummy_data.xlsx
+service-account.json
+test_*.py
+analyze_charts.py
+pptx_chart_editor.py
+prompt.txt
+Template_updated.pptx
+template_structure.json
+output_structure.json
+README.md

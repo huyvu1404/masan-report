@@ -1,0 +1,15 @@
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Override path to match mount point inside container
+      GOOGLE_SERVICE_ACCOUNT_FILE: /app/service-account.json
+    volumes:
+      - ./service-account.json:/app/service-account.json:ro
+      - ./report:/app/report
+      - ./data:/app/data
+    restart: unless-stopped
