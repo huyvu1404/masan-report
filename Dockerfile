@@ -12,7 +12,7 @@ RUN uv sync --frozen --no-dev --no-install-project
 # Copy source code and assets
 COPY src/ ./src/
 COPY main.py ./
-COPY Template_fixed_full.pptx ./
+COPY Template_full_fixed.pptx ./
 
 RUN mkdir -p /app/report /app/data
 
