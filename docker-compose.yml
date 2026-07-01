@@ -8,8 +8,10 @@ services:
     environment:
       # Override path to match mount point inside container
       GOOGLE_SERVICE_ACCOUNT_FILE: /app/service-account.json
+      DB_PATH: /app/db/reports.db
     volumes:
       - ./service-account.json:/app/service-account.json:ro
       - ./report:/app/report
       - ./data:/app/data
+      - ./db:/app/db
     restart: unless-stopped

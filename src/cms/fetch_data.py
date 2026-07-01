@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -48,7 +49,10 @@ _ALL_TYPES = [
 
 _ALL_SENTIMENTS = ["NONE", "POSITIVE", "NEGATIVE", "NEUTRAL"]
 
-_PAGE_SIZE = 500
+_PAGE_SIZE     = 500
+_MAX_RETRIES   = 3
+_RETRY_BACKOFF = (5, 15, 45)  # seconds between attempts
+_RETRIABLE     = (requests.Timeout, requests.exceptions.ConnectionError)
 
 # Map type prefix → channel label
 _CHANNEL_MAP = {
@@ -245,25 +249,31 @@ def _fetch_topic_day(
     def _call(skip: int, track_total: bool) -> dict:
         f  = {**base_filter, "skip": skip, "limit": _PAGE_SIZE}
         ft = {**base_filter, "skip": 0, "limit": _PAGE_SIZE, "trackingTotal": track_total}
-        resp = requests.post(
-            _CMS_URL,
-            json={
-                "operationName": "buzzes",
-                "variables": {
-                    "input": {"indexes": [topic_id]},
-                    "filter": f,
-                    "filterTotal": ft,
-                },
-                "query": _BUZZES_QUERY,
+        payload = {
+            "operationName": "buzzes",
+            "variables": {
+                "input": {"indexes": [topic_id]},
+                "filter": f,
+                "filterTotal": ft,
             },
-            headers=headers,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        body = resp.json()
-        if body.get("errors"):
-            raise ValueError(f"GraphQL errors: {body['errors']}")
-        return body.get("data", {})
+            "query": _BUZZES_QUERY,
+        }
+        last_exc: Exception = RuntimeError("no attempts made")
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(_CMS_URL, json=payload, headers=headers, timeout=60)
+                resp.raise_for_status()
+                body = resp.json()
+                if body.get("errors"):
+                    raise ValueError(f"GraphQL errors: {body['errors']}")
+                return body.get("data", {})
+            except _RETRIABLE as exc:
+                last_exc = exc
+                if attempt < _MAX_RETRIES:
+                    wait = _RETRY_BACKOFF[attempt]
+                    print(f"[fetch_data] {type(exc).__name__} (attempt {attempt + 1}/{_MAX_RETRIES + 1}), retry in {wait}s …")
+                    time.sleep(wait)
+        raise last_exc
 
     # First call: lấy data + total
     first       = _call(skip=0, track_total=True)

@@ -28,9 +28,9 @@ import hashlib
 import json
 import logging
 import os
-import threading
 import traceback
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,10 +44,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from src.cms.login import login, get_project_info
-from src.cms.fetch_data import fetch_data
-from src.cms.data_mapper import buzzes_to_dataframe
+from src.cms.export_data import fetch_data_export
 from src.process_data import process_data
 from src.report_generator import generate_report
+import src.database as db
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -56,7 +56,14 @@ CMS_PROJECT_ID = os.getenv("CMS_PROJECT_ID", "")
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    db.init_db()
+    yield
+
+
 app = FastAPI(
+    lifespan=lifespan,
     title="PPTX Report Generator",
     description=(
         "Generate social listening PPTX reports from Kompa CMS data.\n\n"
@@ -73,26 +80,15 @@ app = FastAPI(
     ],
 )
 
-# ── In-memory task store ──────────────────────────────────────────────────────
-
-_tasks: dict[str, dict] = {}
-_tasks_lock = threading.Lock()
-
-
-def _set_task(task_id: str, **kwargs) -> None:
-    with _tasks_lock:
-        _tasks[task_id].update(kwargs)
-
-
 # ── Paths ─────────────────────────────────────────────────────────────────────
 
 REPORT_DIR = Path("report")
 DATA_DIR   = Path("data")
 
 
-def _report_filename(req: "GenerateRequest") -> str:
+def _report_filename(req: "GenerateRequest", ts: datetime) -> str:
     safe_brand = req.main_brand.replace(" ", "_")
-    return f"report_{safe_brand}_{req.start_date}_{req.end_date}.pptx"
+    return f"{safe_brand}_{req.start_date}_{req.end_date}_{int(ts.timestamp())}.pptx"
 
 
 def _save_report(pptx_bytes: bytes, filename: str) -> str:
@@ -115,18 +111,18 @@ def _cache_key(project_id: str, main_brand: str, competitors: list[str], start_d
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def _load_cached_records(key: str) -> list[dict] | None:
-    data_file = DATA_DIR / f"{key}.json"
-    if not data_file.exists():
-        return None
-    return json.loads(data_file.read_text(encoding="utf-8"))
+def _load_cached_df(key: str):
+    import pandas as pd
+    csv_file = DATA_DIR / f"{key}.csv"
+    if csv_file.exists():
+        return pd.read_csv(csv_file)
+    return None
 
 
-def _save_data_cache(key: str, records: list[dict], req: "GenerateRequest", project_id: str) -> None:
+def _save_data_cache(key: str, df, req: "GenerateRequest", project_id: str) -> None:
+    import pandas as pd
     DATA_DIR.mkdir(exist_ok=True)
-    (DATA_DIR / f"{key}.json").write_text(
-        json.dumps(records, ensure_ascii=False, default=str), encoding="utf-8"
-    )
+    df.to_csv(DATA_DIR / f"{key}.csv", index=False)
     (DATA_DIR / f"{key}.meta.json").write_text(
         json.dumps({
             "key": key,
@@ -135,7 +131,7 @@ def _save_data_cache(key: str, records: list[dict], req: "GenerateRequest", proj
             "competitors": req.competitors,
             "start_date": req.start_date,
             "end_date": req.end_date,
-            "record_count": len(records),
+            "record_count": len(df),
             "created_at": datetime.now().isoformat(),
         }, ensure_ascii=False),
         encoding="utf-8",
@@ -175,28 +171,34 @@ class GenerateRequest(BaseModel):
 
 
 class TaskOut(BaseModel):
-    status:    str       = Field(description="`pending` | `running` | `done` | `failed`")
-    step:      str | None = Field(None, description="Bước đang chạy (khi `running`).")
-    file_path: str | None = Field(None, description="Đường dẫn tuyệt đối file PPTX (khi `done`).")
-    filename:  str | None = Field(None, description="Tên file PPTX (khi `done`).")
-    error:     str | None = Field(None, description="Mô tả lỗi (khi `failed`).")
+    status:           str        = Field(description="`pending` | `running` | `done` | `failed`")
+    step:             str | None = Field(None, description="Bước đang chạy (khi `running`).")
+    file_path:        str | None = Field(None, description="Đường dẫn tuyệt đối file PPTX (khi `done`).")
+    filename:         str | None = Field(None, description="Tên file PPTX (khi `done`).")
+    error:            str | None = Field(None, description="Mô tả lỗi (khi `failed`).")
+    duration_seconds: float | None = Field(None, description="Thời gian chạy tính từ lúc tạo task (giây).")
 
     model_config = {
         "json_schema_extra": {
             "examples": [
-                {"status": "pending",  "step": None,           "file_path": None, "filename": None, "error": None},
-                {"status": "running",  "step": "fetch_data",   "file_path": None, "filename": None, "error": None},
-                {"status": "done",     "step": None,           "file_path": "/app/report/report_MSN_2026-06-22_2026-06-28.pptx", "filename": "report_MSN_2026-06-22_2026-06-28.pptx", "error": None},
-                {"status": "failed",   "step": None,           "file_path": None, "filename": None, "error": "No CMS topics found matching brands: ['MSN']"},
+                {"status": "pending",  "step": None,           "file_path": None, "filename": None, "error": None, "duration_seconds": None},
+                {"status": "running",  "step": "fetch_data",   "file_path": None, "filename": None, "error": None, "duration_seconds": None},
+                {"status": "done",     "step": None,           "file_path": "/app/report/report_MSN_2026-06-22_2026-06-28.pptx", "filename": "report_MSN_2026-06-22_2026-06-28.pptx", "error": None, "duration_seconds": 142.3},
+                {"status": "failed",   "step": None,           "file_path": None, "filename": None, "error": "No CMS topics found matching brands: ['MSN']", "duration_seconds": 8.1},
             ]
         }
     }
 
 
 class ReportItem(BaseModel):
-    filename:   str = Field(examples=["report_MSN_2026-06-22_2026-06-28.pptx"])
-    size_bytes: int = Field(examples=[2048576])
-    created_at: str = Field(examples=["2026-06-29T10:30:00"])
+    filename:    str            = Field(examples=["report_MSN_2026-06-22_2026-06-28.pptx"])
+    main_brand:  str | None     = Field(None, examples=["MSN"])
+    competitors: list[str]      = Field(default=[], examples=[["KIDO", "MWG"]])
+    start_date:  str | None     = Field(None, examples=["2026-06-22"])
+    end_date:    str | None     = Field(None, examples=["2026-06-28"])
+    size_bytes:  int            = Field(examples=[2048576])
+    created_at:  str            = Field(examples=["2026-06-29T10:30:00"])
+    file_exists: bool           = Field(default=True)
 
 
 class DatasetItem(BaseModel):
@@ -231,21 +233,21 @@ def _run_pipeline(task_id: str, req: GenerateRequest) -> None:
                        hour=23, minute=59, second=59)
 
         # ── Check data cache ──────────────────────────────────────────────────
-        _set_task(task_id, status="running", step="check_cache")
-        key     = _cache_key(project_id, req.main_brand, req.competitors, req.start_date, req.end_date)
-        records = _load_cached_records(key)
+        db.update_task(task_id, status="running", step="check_cache")
+        key = _cache_key(project_id, req.main_brand, req.competitors, req.start_date, req.end_date)
+        df  = _load_cached_df(key)
 
-        if records is not None:
-            logger.info("[%s] Cache hit: key=%s, %d records", task_id, key, len(records))
+        if df is not None:
+            logger.info("[%s] Cache hit: key=%s, %d rows", task_id, key, len(df))
         else:
             all_brands = [req.main_brand] + req.competitors
 
             # 1 ── Login
-            _set_task(task_id, step="login")
+            db.update_task(task_id, step="login")
             access_token, refresh_token = login()
 
             # 2 ── Get project info
-            _set_task(task_id, step="get_project_info")
+            db.update_task(task_id, step="get_project_info")
             info = get_project_info(
                 project_id=project_id,
                 access_token=access_token,
@@ -259,35 +261,34 @@ def _run_pipeline(task_id: str, req: GenerateRequest) -> None:
                 )
             logger.info("[%s] Topics: %s", task_id, [t["topic"] for t in info["topics"]])
 
-            # 3 ── Build fetch date range
+            # 3 ── Build date range (current period + equal-length previous period)
             days       = (end_dt.date() - start_dt.date()).days + 1
             prev_start = start_dt - timedelta(days=days)
             from_date  = prev_start.strftime("%Y-%m-%d 00:00:00")
             to_date    = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            # 4 ── Fetch data
-            _set_task(task_id, step="fetch_data")
+            # 4 ── Export data
+            db.update_task(task_id, step="fetch_data")
             topic_ids        = [t["topicId"] for t in info["topics"]]
             topic_id_to_name = {t["topicId"]: t["topic"] for t in info["topics"]}
-            logger.info("[%s] Fetching %d topics: %s", task_id, len(topic_ids), list(topic_id_to_name.values()))
+            logger.info("[%s] Exporting %d topics: %s", task_id, len(topic_ids), list(topic_id_to_name.values()))
 
-            records = fetch_data(
+            df = fetch_data_export(
                 access_token=access_token,
                 refresh_token=refresh_token,
                 topic_ids=topic_ids,
+                topic_id_to_name=topic_id_to_name,
                 from_date=from_date,
                 to_date=to_date,
-                topic_id_to_name=topic_id_to_name,
-                project_labels=info["labels"],
+                project_info=info,
             )
-            logger.info("[%s] Total records: %d", task_id, len(records))
+            logger.info("[%s] Export complete: %d rows", task_id, len(df))
 
-            _save_data_cache(key, records, req, project_id)
+            _save_data_cache(key, df, req, project_id)
             logger.info("[%s] Data cached: key=%s", task_id, key)
 
-        # 5 ── Map to DataFrame
-        _set_task(task_id, step="process_data")
-        df = buzzes_to_dataframe(records)
+        # 5 ── Validate
+        db.update_task(task_id, step="process_data")
         if df.empty:
             raise ValueError("No data returned from CMS for the given date range and topics.")
         logger.info("[%s] DataFrame: %d rows", task_id, len(df))
@@ -296,7 +297,7 @@ def _run_pipeline(task_id: str, req: GenerateRequest) -> None:
         data = process_data(df, req.main_brand, req.competitors, start_dt, end_dt)
 
         # 7 ── Generate PPTX
-        _set_task(task_id, step="generate_report")
+        db.update_task(task_id, step="generate_report")
         if not TEMPLATE_PATH.exists():
             raise FileNotFoundError(f"Template not found: {TEMPLATE_PATH}")
 
@@ -305,15 +306,18 @@ def _run_pipeline(task_id: str, req: GenerateRequest) -> None:
         )
 
         # 8 ── Save
-        filename  = _report_filename(req)
+        filename  = _report_filename(req, datetime.now())
         file_path = _save_report(pptx_bytes, filename)
 
-        _set_task(task_id, status="done", step=None, file_path=file_path, filename=filename)
+        db.save_report(req.main_brand, req.competitors, req.start_date, req.end_date, filename)
+        logger.info("[%s] Report saved to DB: %s", task_id, filename)
+
+        db.update_task(task_id, status="done", step=None, file_path=file_path, filename=filename)
         logger.info("[%s] Done → %s", task_id, file_path)
 
     except Exception as exc:
         logger.error("[%s] Pipeline failed:\n%s", task_id, traceback.format_exc())
-        _set_task(task_id, status="failed", step=None, error=str(exc))
+        db.update_task(task_id, status="failed", step=None, error=str(exc))
 
 
 # ── Endpoints — Pipeline ──────────────────────────────────────────────────────
@@ -359,24 +363,20 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
     - Nếu **chưa có**, tạo task mới → poll `GET /task/{task_id}` để theo dõi tiến độ.
     - Data thô sẽ được **cache** vào `./data`; lần sau cùng params sẽ bỏ qua bước fetch.
     """
-    filename  = _report_filename(req)
-    file_path = REPORT_DIR / filename
-    if file_path.exists():
-        return {
-            "already_exists": True,
-            "filename":       filename,
-            "message":        f"Report đã tồn tại. Dùng GET /reports/{filename} để tải về.",
-        }
+    # Check SQLite for exact match (main_brand + competitors + dates)
+    existing = db.find_report(req.main_brand, req.competitors, req.start_date, req.end_date)
+    if existing:
+        fname = existing["report_name"]
+        if (REPORT_DIR / fname).exists():
+            return {
+                "already_exists": True,
+                "filename":       fname,
+                "message":        f"Report đã tồn tại. Dùng GET /reports/{fname}/download để tải về.",
+            }
+        # Record in DB but file deleted — fall through to regenerate
 
     task_id = str(uuid.uuid4())
-    with _tasks_lock:
-        _tasks[task_id] = {
-            "status":    "pending",
-            "step":      None,
-            "file_path": None,
-            "filename":  None,
-            "error":     None,
-        }
+    db.create_task(task_id, req.main_brand, req.competitors, req.start_date, req.end_date)
     background_tasks.add_task(_run_pipeline, task_id, req)
     return {"task_id": task_id}
 
@@ -387,7 +387,7 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
     summary="Danh sách tất cả tasks",
     responses={
         200: {
-            "description": "Map task_id → trạng thái task.",
+            "description": "Map task_id → trạng thái task (lưu trong DB, không mất khi restart).",
             "content": {
                 "application/json": {
                     "example": {
@@ -412,9 +412,8 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
     },
 )
 def list_tasks():
-    """Trả về toàn bộ tasks đang lưu trong bộ nhớ (reset khi server khởi động lại)."""
-    with _tasks_lock:
-        return dict(_tasks)
+    """Trả về toàn bộ tasks đã lưu trong DB."""
+    return db.list_tasks()
 
 
 @app.get(
@@ -457,8 +456,7 @@ def get_task(task_id: str):
 
     Khi `status=done`, dùng `GET /task/{task_id}/download` để tải file.
     """
-    with _tasks_lock:
-        task = _tasks.get(task_id)
+    task = db.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
     return task
@@ -477,8 +475,7 @@ def get_task(task_id: str):
 )
 def download_task(task_id: str):
     """Tải file PPTX sau khi task có `status=done`."""
-    with _tasks_lock:
-        task = _tasks.get(task_id)
+    task = db.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found")
     if task["status"] != "done":
@@ -514,19 +511,43 @@ def download_task(task_id: str):
     },
 )
 def list_reports():
-    """Liệt kê tất cả file `.pptx` trong `./report`."""
+    """Liệt kê tất cả report (từ SQLite + file `.pptx` chưa có trong DB)."""
     REPORT_DIR.mkdir(exist_ok=True)
-    files = sorted(REPORT_DIR.glob("*.pptx"), key=lambda f: f.stat().st_mtime, reverse=True)
-    return {
-        "reports": [
-            {
-                "filename":   f.name,
-                "size_bytes": f.stat().st_size,
-                "created_at": datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
-            }
-            for f in files
-        ]
-    }
+    db_records = db.list_reports()
+    result = []
+    seen: set[str] = set()
+
+    for r in db_records:
+        fname = r["report_name"]
+        seen.add(fname)
+        fpath = REPORT_DIR / fname
+        exists = fpath.exists()
+        result.append({
+            "filename":    fname,
+            "main_brand":  r["main_brand"],
+            "competitors": r["competitors"],
+            "start_date":  r["start_date"],
+            "end_date":    r["end_date"],
+            "size_bytes":  fpath.stat().st_size if exists else 0,
+            "created_at":  r["created_at"],
+            "file_exists": exists,
+        })
+
+    # Include files on disk not tracked in DB (e.g., manually uploaded)
+    for f in sorted(REPORT_DIR.glob("*.pptx"), key=lambda f: f.stat().st_mtime, reverse=True):
+        if f.name not in seen:
+            result.append({
+                "filename":    f.name,
+                "main_brand":  None,
+                "competitors": [],
+                "start_date":  None,
+                "end_date":    None,
+                "size_bytes":  f.stat().st_size,
+                "created_at":  datetime.fromtimestamp(f.stat().st_mtime).isoformat(),
+                "file_exists": True,
+            })
+
+    return {"reports": result}
 
 
 @app.post(
@@ -596,13 +617,14 @@ def download_report_by_filename(filename: str):
     },
 )
 def delete_report(filename: str):
-    """Xoá file `.pptx` khỏi `./report`."""
+    """Xoá file `.pptx` khỏi `./report` và xoá record trong DB."""
     if not filename.endswith(".pptx"):
         raise HTTPException(status_code=400, detail="Chỉ chấp nhận file .pptx")
     file_path = REPORT_DIR / filename
     if not file_path.exists():
         raise HTTPException(status_code=404, detail=f"File '{filename}' không tồn tại")
     file_path.unlink()
+    db.delete_report_by_name(filename)
     return {"deleted": filename}
 
 
@@ -638,14 +660,20 @@ def delete_report(filename: str):
     },
 )
 def list_data():
-    """Liệt kê tất cả dataset thô đã cache trong `./data`."""
+    """Liệt kê tất cả dataset đã cache trong `./data`."""
     DATA_DIR.mkdir(exist_ok=True)
     meta_files = sorted(DATA_DIR.glob("*.meta.json"), key=lambda f: f.stat().st_mtime, reverse=True)
     datasets = []
     for mf in meta_files:
         meta = json.loads(mf.read_text(encoding="utf-8"))
-        data_file = DATA_DIR / f"{meta['key']}.json"
-        meta["size_bytes"] = data_file.stat().st_size if data_file.exists() else 0
+        # Support both new CSV cache and legacy JSON cache
+        for ext in (".csv", ".json"):
+            data_file = DATA_DIR / f"{meta['key']}{ext}"
+            if data_file.exists():
+                meta["size_bytes"] = data_file.stat().st_size
+                break
+        else:
+            meta["size_bytes"] = 0
         datasets.append(meta)
     return {"datasets": datasets}
 
@@ -668,16 +696,17 @@ def list_data():
 )
 def delete_data(key: str):
     """
-    Xoá cặp file `{key}.json` + `{key}.meta.json` khỏi `./data`.
+    Xoá dataset cache khỏi `./data` (hỗ trợ cả `.csv` và `.json` legacy).
 
     `key` lấy từ trường `key` trong kết quả `GET /data`.
     """
-    data_file = DATA_DIR / f"{key}.json"
+    csv_file  = DATA_DIR / f"{key}.csv"
+    json_file = DATA_DIR / f"{key}.json"
     meta_file = DATA_DIR / f"{key}.meta.json"
-    if not data_file.exists() and not meta_file.exists():
+    if not csv_file.exists() and not json_file.exists() and not meta_file.exists():
         raise HTTPException(status_code=404, detail=f"Dataset '{key}' không tồn tại")
     deleted = []
-    for f in [data_file, meta_file]:
+    for f in [csv_file, json_file, meta_file]:
         if f.exists():
             f.unlink()
             deleted.append(f.name)
