@@ -65,7 +65,6 @@ mutation exportBuzzes(
     type: $type
     select: $select
   ) {
-    status
     message
     data {
       status
@@ -161,20 +160,23 @@ def _split_ranges(
     types: list[str],
     sentiments: list[str],
     threshold: int,
-) -> list[tuple[str, str]]:
-    """Recursively halve [from_date, to_date] until each chunk has ≤ threshold rows."""
+) -> list[tuple[str, str, int]]:
+    """
+    Recursively halve [from_date, to_date] until each chunk has ≤ threshold rows.
+    Returns list of (from_date, to_date, expected_count).
+    """
     total = count_buzzes(headers, topic_ids, from_date, to_date, types, sentiments)
     print(f"[export] count {from_date[:10]} → {to_date[:10]}: {total:,}")
 
     if total <= threshold:
-        return [(from_date, to_date)]
+        return [(from_date, to_date, total)]
 
     start = datetime.strptime(from_date[:10], "%Y-%m-%d")
     end   = datetime.strptime(to_date[:10],   "%Y-%m-%d")
 
     if start >= end:
         # Single day, cannot split further — proceed anyway
-        return [(from_date, to_date)]
+        return [(from_date, to_date, total)]
 
     mid        = start + (end - start) // 2
     mid_end    = f"{mid.strftime('%Y-%m-%d')} 23:59:59"
@@ -356,20 +358,29 @@ def fetch_data_export(
         headers, topic_ids, from_date, to_date,
         resolved_types, resolved_sentiments, MAX_EXPORT_ROWS,
     )
-    print(f"[export] {len(chunks)} chunk(s): {[f'{a[:10]}→{b[:10]}' for a, b in chunks]}")
+    print(f"[export] {len(chunks)} chunk(s): {[f'{a[:10]}→{b[:10]}({c:,})' for a, b, c in chunks]}")
 
     # Export each chunk (with per-chunk retry on job failure)
     frames: list[pd.DataFrame] = []
-    for chunk_from, chunk_to in chunks:
+    for chunk_from, chunk_to, expected in chunks:
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                file_name   = trigger_export(headers, topic_id_name_pairs, chunk_from, chunk_to, project_info, resolved_types, resolved_sentiments)
-                record      = poll_export(headers, file_name)
-                raw_df      = download_and_read(headers, record["downloadLink"])
+                file_name = trigger_export(headers, topic_id_name_pairs, chunk_from, chunk_to, project_info, resolved_types, resolved_sentiments)
+                record    = poll_export(headers, file_name)
+                raw_df    = download_and_read(headers, record["downloadLink"])
+                actual    = len(raw_df)
+
+                # Validate completeness — retry if incomplete
+                if expected > 0 and actual < expected:
+                    raise ValueError(
+                        f"Incomplete export: {chunk_from[:10]}→{chunk_to[:10]} "
+                        f"got {actual:,}/{expected:,} rows ({actual/expected:.0%})"
+                    )
+                print(f"[export] chunk {chunk_from[:10]}→{chunk_to[:10]}: {actual:,}/{expected:,} rows")
+
                 frames.append(raw_df)
-                print(f"[export] chunk {chunk_from[:10]}→{chunk_to[:10]}: {len(raw_df):,} rows")
                 break
-            except (RuntimeError, TimeoutError) as exc:
+            except (RuntimeError, TimeoutError, ValueError) as exc:
                 if attempt < _MAX_RETRIES:
                     wait = _RETRY_BACKOFF[attempt]
                     print(f"[export] chunk {chunk_from[:10]}→{chunk_to[:10]} failed ({exc}), retry in {wait}s")

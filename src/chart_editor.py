@@ -341,7 +341,9 @@ class PptxChartEditor:
         # Nếu số phần tử khác nhau → rebuild
         if len(v_elements) != len(values):
             # Tìm parent của các <v> (thường là <c:strCache> hoặc <c:numCache>)
-            cache = container.find(f".//{{{C}}}strCache") or container.find(f".//{{{C}}}numCache")
+            cache = container.find(f".//{{{C}}}strCache")
+            if cache is None:
+                cache = container.find(f".//{{{C}}}numCache")
             if cache is not None:
                 for old_v in cache.findall(f"{{{C}}}pt"):
                     cache.remove(old_v)

@@ -373,9 +373,7 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
                 "filename":       fname,
                 "message":        f"Report đã tồn tại. Dùng GET /reports/{fname}/download để tải về.",
             }
-        # Record in DB but file deleted — fall through to regenerate
 
-    # 2. Atomic check + create — ngăn duplicate pipeline khi 2 request đến cùng lúc
     task_id, created = db.claim_task(
         str(uuid.uuid4()), req.main_brand, req.competitors, req.start_date, req.end_date
     )
@@ -384,7 +382,6 @@ def generate(req: GenerateRequest, background_tasks: BackgroundTasks):
 
     background_tasks.add_task(_run_pipeline, task_id, req)
     return {"task_id": task_id}
-
 
 @app.get(
     "/tasks",
